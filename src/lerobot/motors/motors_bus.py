@@ -21,6 +21,7 @@
 
 import abc
 import logging
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -594,6 +595,7 @@ class MotorsBus(abc.ABC):
         try:
             yield
         finally:
+            time.sleep(0.03)
             self.enable_torque(motors)
 
     def set_timeout(self, timeout_ms: int | None = None):

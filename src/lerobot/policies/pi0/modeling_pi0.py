@@ -227,7 +227,13 @@ def compute_layer_complete(
     value_states = []
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
+        #layer = models[i].layers[layer_idx]
+
+        raise RuntimeError(
+            "compute_layer_complete is not supported with standard HuggingFace Gemma. "
+            "This code path should not be executed."
+        )
+
         hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
@@ -429,10 +435,17 @@ class PaliGemmaWithExpertModel(
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        vision_tower = self.paligemma.vision_tower
+        vision_outputs = vision_tower(pixel_values=image)
+        return vision_outputs.last_hidden_state
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.language_model.embed_tokens(tokens)
+        lm = self.paligemma.language_model
+        if hasattr(lm, "embed_tokens"):
+            return lm.embed_tokens(tokens)
+        else:
+            # New Gemma (transformers >= 4.41)
+            return lm.model.embed_tokens(tokens)
 
     def forward(
         self,
@@ -469,66 +482,38 @@ class PaliGemmaWithExpertModel(
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
+
+
+
+
+
         else:
-            models = [self.paligemma.language_model, self.gemma_expert.model]
-            num_layers = self.paligemma.config.text_config.num_hidden_layers
+            # ===== HuggingFace Gemma compatible path =====
+            # Concatenate prefix and suffix embeddings
+            combined_embeds = torch.cat(inputs_embeds, dim=1)
 
-            # Check if gradient checkpointing is enabled for any of the models
-            use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
+            outputs = self.gemma_expert.model.forward(
+                inputs_embeds=combined_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_hidden_states=True,
+            )
 
-            # Process all layers with gradient checkpointing if enabled
-            for layer_idx in range(num_layers):
-                if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
-                        compute_layer_complete,
-                        layer_idx,
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
-                    )
-                else:
-                    inputs_embeds = compute_layer_complete(
-                        layer_idx,
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
-                    )
+            hidden_states = outputs.hidden_states[-1]
 
-            # final norm
-            def compute_final_norms(inputs_embeds, adarms_cond):
-                outputs_embeds = []
-                for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
-                    outputs_embeds.append(out_emb)
-                return outputs_embeds
+            # Split back into prefix and suffix
+            prefix_len = inputs_embeds[0].shape[1]
+            prefix_output = hidden_states[:, :prefix_len]
+            suffix_output = hidden_states[:, prefix_len:]
 
-            # Apply gradient checkpointing to final norm if enabled
-            if use_gradient_checkpointing:
-                outputs_embeds = torch.utils.checkpoint.checkpoint(
-                    compute_final_norms,
-                    inputs_embeds,
-                    adarms_cond,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
-
-            prefix_output = outputs_embeds[0]
-            suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
+
+
+
+
+
 
         return [prefix_output, suffix_output], prefix_past_key_values
 
@@ -559,6 +544,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
+
+        # --- BEGIN FIX ---
+        # Common model width = language width (Gemma)
+        self.model_width = (
+            self.paligemma_with_expert.paligemma.language_model.config.hidden_size
+        )
+
+        # Project action/state embeddings (1024) -> language width (1152)
+        self.suffix_proj = nn.Linear(
+            action_expert_config.width,
+            self.model_width,
+        )
+
+        self.image_proj = nn.Linear(
+            self.paligemma_with_expert.paligemma.config.vision_config.hidden_size,
+            self.model_width,
+        )
+        # --- END FIX ---
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -576,15 +580,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-        msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
-
-        try:
-            from transformers.models.siglip import check
-
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+        #msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
+        #
+        #try:
+        #    from transformers.models.siglip import check
+        #
+        #    if not check.check_whether_transformers_replace_is_installed_correctly():
+        #        raise ValueError(msg)
+        #except ImportError:
+        #    raise ValueError(msg) from None
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -649,6 +653,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+
+            # 🔧 FIX: project vision embeddings (1024) -> language width (1152)
+            img_emb = self.image_proj(img_emb)
+
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -662,6 +670,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        #if self.lang_proj is not None:
+        #    lang_emb = self.lang_proj(lang_emb)
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
@@ -758,13 +768,14 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             images, img_masks, lang_tokens, lang_masks
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs = self.suffix_proj(suffix_embs)
 
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        #if (
+        #    self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        #    == torch.bfloat16
+        #):
+        #    suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+        #    prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)

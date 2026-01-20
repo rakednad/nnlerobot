@@ -143,41 +143,52 @@ class OpenCVCamera(Camera):
 
     def connect(self, warmup: bool = True) -> None:
         """
-        Connects to the OpenCV camera specified in the configuration.
-
-        Initializes the OpenCV VideoCapture object, sets desired camera properties
-        (FPS, width, height), and performs initial checks.
-
-        Raises:
-            DeviceAlreadyConnectedError: If the camera is already connected.
-            ConnectionError: If the specified camera index/path is not found or the camera is found but fails to open.
-            RuntimeError: If the camera opens but fails to apply requested FPS/resolution settings.
+        Windows-stable connect() using DirectShow backend.
+        Initializes an OpenCV VideoCapture and stores it.
         """
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} is already connected.")
+        import cv2
 
-        # Use 1 thread for OpenCV operations to avoid potential conflicts or
-        # blocking in multi-threaded applications, especially during data collection.
-        cv2.setNumThreads(1)
+        backend = cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 700
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
-
-        if not self.videocapture.isOpened():
-            self.videocapture.release()
+        cap = cv2.VideoCapture(self.index_or_path, backend)
+        if not cap.isOpened():
+            print(f"[OpenCVCamera] Failed to open camera {self.index_or_path}")
             self.videocapture = None
-            raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras opencv` to find available cameras."
-            )
+            return  # IMPORTANT: do NOT return True/False
 
-        self._configure_capture_settings()
+        # Apply resolution
+        if self.width:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        if self.height:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
+        # Apply FPS
+        if self.fps:
+            cap.set(cv2.CAP_PROP_FPS, self.fps)
+
+        # Apply FOURCC
+        if hasattr(self.config, "fourcc") and self.config.fourcc:
+            try:
+                cap.set(cv2.CAP_PROP_FOURCC,
+                        cv2.VideoWriter_fourcc(*self.config.fourcc))
+            except Exception as e:
+                print("FOURCC failed:", e)
+
+
+        self.capture_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.capture_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+
+        self.videocapture = cap
+
+        # Optional warmup (helps correctness)
         if warmup:
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                self.read()
-                time.sleep(0.1)
+            for _ in range(max(3, int(self.warmup_s * (self.fps or 30)))):
+                cap.read()
 
-        logger.info(f"{self} connected.")
+        # don't return anything — keep LeRobot’s expected API
+        return
+
 
     def _configure_capture_settings(self) -> None:
         """

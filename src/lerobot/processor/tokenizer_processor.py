@@ -219,7 +219,7 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             max_length=self.max_length,
             truncation=self.truncation,
             padding=self.padding,
-            padding_side=self.padding_side,
+            #padding_side=self.padding_side,
             return_tensors="pt",
         )
 

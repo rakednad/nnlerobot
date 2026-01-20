@@ -71,11 +71,27 @@ def get_cv2_rotation(rotation: Cv2Rotation) -> int | None:
 
 
 def get_cv2_backend() -> int:
+    """
+    Reliable backend selector for Windows & Linux.
+
+    - On Windows: force DirectShow (DSHOW) because MSMF backend fails on many cameras.
+    - On Linux: default to V4L2 (Video4Linux).
+    """
+
+    import sys
     import cv2
 
-    if platform.system() == "Windows":
-        return int(cv2.CAP_MSMF)  # Use MSMF for Windows instead of AVFOUNDATION
-    # elif platform.system() == "Darwin":  # macOS
-    #     return cv2.CAP_AVFOUNDATION
-    else:  # Linux and others
-        return int(cv2.CAP_ANY)
+    # ---- Windows: Force DirectShow ----
+    if sys.platform.startswith("win"):
+        if hasattr(cv2, "CAP_DSHOW"):
+            return cv2.CAP_DSHOW
+        return 700  # Hardcoded DSHOW fallback
+
+    # ---- Linux: Use V4L2 if available ----
+    if sys.platform.startswith("linux"):
+        if hasattr(cv2, "CAP_V4L2"):
+            return cv2.CAP_V4L2
+        return 200  # generic fallback
+
+    # ---- macOS fallback ----
+    return cv2.CAP_ANY

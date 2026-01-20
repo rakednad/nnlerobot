@@ -1,0 +1,8 @@
+cameras:
+  testcam:
+    type: opencv
+    device_id: 0
+    backend: dshow
+    fps: 30
+    width: 640
+    height: 480
